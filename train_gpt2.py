@@ -4,11 +4,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+MAX_STEPS = 100
+WARMUP_STEPS = 20
 
+def get_lr(it, max_lr, ratio):
+  if it < WARMUP_STEPS:
+    lr = max_lr * (it+1) / WARMUP_STEPS
+  else if it > MAX_STEPS:
+    lr = ratio * max_lr
+
+  theta = (it-WARMUP_STEPS)/(MAX_STEPS-WARMUP_STEPS)
+  coeff = (1 + math.cos(theta*math.pi)) * 0.5
+  lr = ratio * max_lr + coeff * (max_lr - ratio * max_lr)
+
+  return lr
+
+
+def configure_optimizer(model):
+  decay_params = [param if len(param[1].size()) >= 2 for param in model.named_parameters()]
+  non_decay_params = [param if len(param[1].size()) < 2 for param in model.named_parameters()]
+
+  for 
+  
+  optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+  
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50257
+    vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 4
     n_embd: int = 768
@@ -44,6 +68,7 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, config.n_embd*4)
         self.c_proj = nn.Linear(config.n_embd*4, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         self.gelu = nn.GELU(approximate='tanh')
 
     def forward(self, x):
@@ -57,6 +82,7 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_embd = config.n_embd
         self.n_head = config.n_head
         self.config = config
@@ -72,18 +98,40 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B,T,self.n_head,C//self.n_head).transpose(1,2) # (B, nh, T, hs)
         v = v.view(B,T,self.n_head,C//self.n_head).transpose(1,2) # (B, nh, T, hs)
 
-        qkt = q @ k.transpose(-2, -1)
-        qkt = qkt / math.sqrt(k.size(-1))
+        # qkt = q @ k.transpose(-2, -1)
+        # qkt = qkt / math.sqrt(k.size(-1))
 
-        # Make it autoregressive
-        qkt = qkt.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        attn_weights = nn.functional.softmax(qkt, dim=-1)
+        # # Make it autoregressive
+        # qkt = qkt.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # attn_weights = nn.functional.softmax(qkt, dim=-1)
 
-        attn_out = attn_weights @ v
+        # attn_out = attn_weights @ v
+
+        # Using flash attention
+        attn_out = F.scaled_dot_product_attention(q,k,v,is_causal=True)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         return self.c_proj(attn_out)
 
+import tiktoken
+class DataLoaderLite:
+    def __init__(self, B, T):
+        with open("/home/abhishek/Desktop/Brinc/Software/gpt2_learn/input.txt", 'r', encoding='utf-8') as f:
+            text_data = f.read()
+        enc = tiktoken.encoding_for_model("gpt-2")
+        tokens = enc.encode(text_data)
+        self.data = torch.tensor(tokens)
+        self.batch_size = B
+        self.context = T
+        self.current_position = 0
 
+    def next_batch(self):
+        buf = self.data[self.current_position:self.current_position+self.batch_size*self.context+1]
+        x = buf[:self.batch_size*self.context].view(self.batch_size, self.context)
+        y = buf[1:self.batch_size*self.context+1].view(self.batch_size, self.context)
+        self.current_position += self.batch_size*self.context
+        if self.current_position + self.batch_size*self.context + 1 > self.data.size(-1):
+            self.current_position = 0
+        return x, y
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -99,16 +147,19 @@ class GPT(nn.Module):
             "ln_f": nn.LayerNorm(config.n_embd),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.weight = self.transformer.wte.weight
         self.apply(self._init_weights)
-
+        
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, 0.0, 0.02)
+            std = 0.02
+            if (hasattr(module, "NANOGPT_SCALE_INIT")):
+                std *= (2*self.config.n_layer)**(-0.5)
+            torch.nn.init.normal_(module.weight, 0.0, std)                
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, 0.0, 0.02)
-    
 
     def forward(self, input, target):
         B,T = input.shape
@@ -121,8 +172,9 @@ class GPT(nn.Module):
             x = self.transformer.h[i](x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
+        # import code; code.interact(local=locals())
         loss = None
-        if target:
+        if target is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
         return logits, loss
     
@@ -133,29 +185,39 @@ def get_text_data(file_path):
     return text_data
 
 # Set device
-device ="cpu"
+total_batch_size = 524288
+B,T = 1, 1024
+total_gradient_steps = total_batch_size/(B*T)
+
+torch.set_float32_matmul_precision("high")
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Load dataset
-text_data = get_text_data('input.txt')
-import tiktoken
-enc = tiktoken.encoding_for_model("gpt-2")
-tokens = enc.encode(text_data)
-
-
-buf = torch.tensor(tokens[:4*6+1])
-buf = buf.to(device)
-
-x = buf[:-1].view([4,6])
-y = buf[1:].view([4,6])
+loader = DataLoaderLite(B,T)
 
 model = GPT(GPTConfig())
 model.to(device)
-
+model = torch.compile(model)
 optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-for epoch in range(50):
+import time
+for epoch in range(700):
+    start_time = time.time()
     optim.zero_grad()
-    logits, loss = model(x,y)
-    loss.backward()
+    # Set lr for all param groups
+    lr = get_lr(it, 3e-4, 0.1)
+    for param_group in optim.param_groups:
+      param_group['lr'] = lr
+
+    for gradient_step in range(total_gradient_steps):
+      x,y = loader.next_batch()
+      x = x.to(device)
+      y = y.to(device)
+      with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x,y)
+      loss = loss/total_gradient_steps
+      loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optim.step()
-    print(f"epoch {epoch}, loss {loss.item()}")
+    end_time = time.time()
+    print(f"epoch {epoch}, lr {lr:.4f}, loss {loss.item()}, time {end_time - start_time:.4f}s, tokens/sec {(B*T)/(end_time - start_time):.4f}s, norm {norm:.4f}")

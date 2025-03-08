@@ -19,15 +19,6 @@ def get_lr(it, max_lr, ratio):
 
   return lr
 
-
-def configure_optimizer(model):
-  decay_params = [param if len(param[1].size()) >= 2 for param in model.named_parameters()]
-  non_decay_params = [param if len(param[1].size()) < 2 for param in model.named_parameters()]
-
-  for 
-  
-  optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
-
   
 @dataclass
 class GPTConfig:
@@ -114,7 +105,7 @@ class CausalSelfAttention(nn.Module):
 
 import tiktoken
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes, split="train"):
         with open("/home/abhishek/Desktop/Brinc/Software/gpt2_learn/input.txt", 'r', encoding='utf-8') as f:
             text_data = f.read()
         enc = tiktoken.encoding_for_model("gpt-2")
@@ -122,15 +113,17 @@ class DataLoaderLite:
         self.data = torch.tensor(tokens)
         self.batch_size = B
         self.context = T
-        self.current_position = 0
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.current_position = self.process_rank * B * T
 
     def next_batch(self):
         buf = self.data[self.current_position:self.current_position+self.batch_size*self.context+1]
         x = buf[:self.batch_size*self.context].view(self.batch_size, self.context)
         y = buf[1:self.batch_size*self.context+1].view(self.batch_size, self.context)
-        self.current_position += self.batch_size*self.context
-        if self.current_position + self.batch_size*self.context + 1 > self.data.size(-1):
-            self.current_position = 0
+        self.current_position += self.num_processes * self.batch_size * self.context
+        if self.current_position + self.num_processes * self.batch_size*self.context + 1 > self.data.size(-1):
+            self.current_position = self.process_rank * B * T
         return x, y
 
 class GPT(nn.Module):
@@ -161,6 +154,23 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, 0.0, 0.02)
 
+
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+        param_dict = {pn:p for pn, p in self.named_parameters()}
+        param_dict = {pn:p for pn, p in param_dict if p.requires_grad}
+
+        decay_params = [p for pn, p in param_dict if len(p.size()) >= 2]
+        nodecay_params = [p for pn, p in param_dict if len(p.size()) < 2]
+
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0},
+        ]
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        optim = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9,0.95), eps=1e-8, fused=use_fused)
+        return optim
+
     def forward(self, input, target):
         B,T = input.shape
         pos = torch.arange(0,T, dtype=torch.long, device=input.device)
@@ -178,6 +188,43 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
         return logits, loss
     
+
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+ddp = int(os.environ.get("RANK", -1)) != -1
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+# added after video, pytorch can be serious about it's device vs. device_type distinction
+device_type = "cuda" if device.startswith("cuda") else "cpu"
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
 # Get data
 def get_text_data(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -187,18 +234,26 @@ def get_text_data(file_path):
 # Set device
 total_batch_size = 524288
 B,T = 1, 1024
-total_gradient_steps = total_batch_size/(B*T)
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+total_gradient_steps = total_batch_size // (B*T*ddp_world_size)
 
 torch.set_float32_matmul_precision("high")
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Load dataset
-loader = DataLoaderLite(B,T)
+loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 
 model = GPT(GPTConfig())
 model.to(device)
-model = torch.compile(model)
-optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+if use_compile:
+    model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+
+# optimize!
+optim = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 import time
 for epoch in range(700):
@@ -221,3 +276,6 @@ for epoch in range(700):
     optim.step()
     end_time = time.time()
     print(f"epoch {epoch}, lr {lr:.4f}, loss {loss.item()}, time {end_time - start_time:.4f}s, tokens/sec {(B*T)/(end_time - start_time):.4f}s, norm {norm:.4f}")
+
+if ddp:
+    destroy_process_group()

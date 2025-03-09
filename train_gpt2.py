@@ -10,7 +10,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import tiktoken
-
+import numpy as np
 
 @dataclass
 class GPTConfig:
@@ -112,24 +112,34 @@ class CausalSelfAttention(nn.Module):
         )  # re-assemble all head outputs side by side
         return self.c_proj(attn_out)
 
+def load_token(shard):
+    npt = np.load(shard)
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
 class DataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes, split="train"):
-        with open(
-            "/home/abhishek/Desktop/Brinc/Software/gpt2_learn/input.txt",
-            "r",
-            encoding="utf-8",
-        ) as f:
-            text_data = f.read()
-        enc = tiktoken.encoding_for_model("gpt-2")
-        tokens = enc.encode(text_data)
-        self.data = torch.tensor(tokens)
+        self.shard_id = 0
+        self.enc = tiktoken.encoding_for_model("gpt-2")
         self.batch_size = B
         self.context = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {'train', 'val'}
+        self.shards = sorted([
+            s for s in os.listdir(os.path.join(os.path.dirname(__file__), "edu_fineweb10B")) 
+            if s.startswith(f"edufineweb_{split}_") and s.endswith(".npy")
+        ])
         self.current_position = self.process_rank * B * T
-
+        self.split = split
+        self.data = load_token(os.path.join(os.path.dirname(__file__), f"edu_fineweb10B/{self.shards[self.shard_id]}"))
+    
+    def reset(self):
+        self.shard_id = 0
+        self.data = load_token(os.path.join(os.path.dirname(__file__), f"edu_fineweb10B/{self.shards[self.shard_id]}"))
+        self.current_position = self.process_rank * self.batch_size * self.context
+        
     def next_batch(self):
         buf = self.data[
             self.current_position : self.current_position
@@ -147,9 +157,10 @@ class DataLoaderLite:
             + 1
             > self.data.size(-1)
         ):
-            self.current_position = self.process_rank * B * T
+            self.shard_id = (self.shard_id + 1) % len(self.shards)
+            self.data = load_token(os.path.join(os.path.dirname(__file__), f"edu_fineweb10B/{self.shards[self.shard_id]}"))
+            self.current_position = self.process_rank * self.batch_size * self.context
         return x, y
-
 
 class GPT(nn.Module):
     def __init__(self, config):

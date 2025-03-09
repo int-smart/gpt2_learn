@@ -283,9 +283,18 @@ total_gradient_steps = total_batch_size // (B * T * ddp_world_size)
 torch.set_float32_matmul_precision("high")
 
 # Load dataset
-loader = DataLoaderLite(
+trainloader = DataLoaderLite(
     B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train"
 )
+validloader = DataLoaderLite(
+    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="valid"
+)
+
+# Create log file
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+
 
 model = GPT(GPTConfig())
 model.to(device)
@@ -306,6 +315,75 @@ optim = raw_model.configure_optimizers(
 
 for step in range(max_steps):
     start_time = time.time()
+    last_step = (max_steps - 1 == step)
+
+    if step % 250 == 0 or last_step:
+        model.eval()
+
+        with torch.no_grad():
+            valid_loss_accum = 0.0
+            valid_steps = 20
+            for i in range(valid_steps):
+                x, y = validloader.next_batch()
+                x = x.to(device)
+                y = y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+            loss = loss / valid_steps
+            valid_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(valid_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"Validation ran at step {step} wit validation loss {valid_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"Validation ran at step {step} wit validation loss {valid_loss_accum.item():.4f}\n")
+            
+            if (step % 5000 == 0 or last_step) and step > 0:
+                # Save model checkpoint
+                chkpt_dir = os.path.join("checkpoints",f"step_{step}")
+                os.makedirs(chkpt_dir, exist_ok=True)
+
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'optimizer': optim.state_dict(),
+                    'step': step,
+                    'config': raw_model.config,
+                    'valid_loss': valid_loss_accum.item()
+                }
+
+                checkpoint_path = os.path.join(chkpt_dir, "model.pt")
+                torch.save(checkpoint, checkpoint_path)
+                print(f"Model checkpoint saved at {checkpoint_path}")
+
+    # Sample outputs
+    if step % 250 == 0 or last_step:
+        model.eval()
+        max_length = 32
+        num_return_sequences = 4
+        sample_context = "Hello, I'm a language model,"
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        enc = tiktoken.encoding_for_model("gpt-2")
+        context_tokens = enc.encode(sample_context)
+        context_tensor = torch.tensor(context_tokens, dtype=torch.long)
+        context_tensor = context_tensor.unsqueeze(0).repeat(num_return_sequences, 1)
+        while context_tensor.size(-1) < max_length:
+            with torch.no_grad():
+                x = context_tensor.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, _ = model(x, None)
+                logits = logits[:,-1,:] # [B, T, vocab_size]
+                probs = F.softmax(logits, dim=-1)
+                topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1, largest=True, sorted=True)
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
+                id = torch.gather(topk_indices, -1, ix)
+                context_tensor = torch.concat((context_tensor, id), -1)
+        output = context_tensor.tolist()
+        for sample in range(num_return_sequences):
+            print(f"rank {ddp_rank} sample {sample}: {enc.decode(output[sample])}")
+    
+    # Train loop
+    model.train()
     optim.zero_grad()
     loss_accum = 0.0
 
@@ -315,7 +393,7 @@ for step in range(max_steps):
         param_group["lr"] = lr
 
     for gradient_step in range(total_gradient_steps):
-        x, y = loader.next_batch()
+        x, y = trainloader.next_batch()
         x = x.to(device)
         y = y.to(device)
         with torch.autocast(device_type=device, dtype=torch.bfloat16):

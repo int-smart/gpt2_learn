@@ -285,6 +285,21 @@ def get_lr(it, max_lr, ratio):
 
     return lr
 
+def get_avg_pred(logits, tokens, mask):
+    logits = (logits[:, :-1, :]).contiguous()
+    shifted_tokens = (tokens[:, 1:]).contiguous()
+    flat_logits = logits.view(-1, logits.size(-1))
+    flat_tokens = shifted_tokens.view(-1)
+
+    shifted_loss = F.cross_entropy(flat_logits, flat_tokens, reduction="none")
+    shifted_loss = shifted_loss.view(tokens.size(0), -1)
+    mask = mask[:,1:].contiguous()
+    masked_loss = shifted_loss * mask
+    sum_loss = torch.sum(masked_loss, dim=1)
+    avg_loss = sum_loss / mask.sum(dim=1)
+    pred = sum_loss.argmin().item()
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
 
 assert (
     total_batch_size % (B * T * ddp_world_size) == 0
@@ -393,6 +408,34 @@ for step in range(max_steps):
         for sample in range(num_return_sequences):
             print(f"rank {ddp_rank} sample {sample}: {enc.decode(output[sample])}")
     
+    if step % 250 == 0 or last_step and (not use_compile):
+        model.eval()
+        num_total = 0
+        num_correct_norm = 0
+        for example in iterate_examples("val"):
+            if i % ddp_world_size != ddp_rank:
+                continue
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, _ = model(tokens, None)
+                avg_pred = get_avg_pred(logits, tokens, mask)
+            num_total += 1
+            num_correct_norm += int(avg_pred == label)
+        if ddp:
+            num_total = torch.tensor(num_total, device=device, dtype=torch.long)
+            num_correct_norm = torch.tensor(num_correct_norm, device=device, dtype=torch.long)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
     # Train loop
     model.train()
     optim.zero_grad()

@@ -11,13 +11,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import tiktoken
 import numpy as np
-
+from hellaswag import render_example, iterate_examples
+ 
 @dataclass
 class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50304
     n_layer: int = 12
-    n_head: int = 4
+    n_head: int = 12
     n_embd: int = 768
 
 
@@ -192,17 +193,24 @@ class GPT(nn.Module):
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
         param_dict = {pn: p for pn, p in self.named_parameters()}
-        param_dict = {pn: p for pn, p in param_dict if p.requires_grad}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
-        decay_params = [p for pn, p in param_dict if len(p.size()) >= 2]
-        nodecay_params = [p for pn, p in param_dict if len(p.size()) < 2]
+        decay_params = [p for pn, p in param_dict.items() if len(p.size()) >= 2]
+        nodecay_params = [p for pn, p in param_dict.items() if len(p.size()) < 2]
 
         optim_groups = [
             {"params": decay_params, "weight_decay": weight_decay},
             {"params": nodecay_params, "weight_decay": 0},
         ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == "cuda"
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
         optim = torch.optim.AdamW(
             optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
         )
@@ -270,8 +278,8 @@ def get_text_data(file_path):
 total_batch_size = 524288
 B, T = 1, 1024
 warmup_steps = 715
-max_steps = 10e9 / total_batch_size  # For 1 epoch
-
+max_steps = int(10e9 // total_batch_size)  # For 1 epoch
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 
 def get_lr(it, max_lr, ratio):
     if it < warmup_steps:
@@ -305,6 +313,9 @@ assert (
     total_batch_size % (B * T * ddp_world_size) == 0
 ), "make sure total_batch_size is divisible by B * T * ddp_world_size"
 total_gradient_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {total_gradient_steps}")
 
 torch.set_float32_matmul_precision("high")
 
@@ -313,7 +324,7 @@ trainloader = DataLoaderLite(
     B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train"
 )
 validloader = DataLoaderLite(
-    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="valid"
+    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val"
 )
 
 # Create log file
@@ -325,9 +336,7 @@ log_file = os.path.join(log_dir, f"log.txt")
 model = GPT(GPTConfig())
 model.to(device)
 
-use_compile = (
-    True  # torch.compile interferes with HellaSwag eval and Generation. TODO fix
-)
+use_compile = False  # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
     model = torch.compile(model)
 if ddp:
@@ -345,7 +354,7 @@ for step in range(max_steps):
 
     if step % 250 == 0 or last_step:
         model.eval()
-
+        validloader.reset()
         with torch.no_grad():
             valid_loss_accum = 0.0
             valid_steps = 20
@@ -382,7 +391,7 @@ for step in range(max_steps):
                 print(f"Model checkpoint saved at {checkpoint_path}")
 
     # Sample outputs
-    if step % 250 == 0 or last_step:
+    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
         model.eval()
         max_length = 32
         num_return_sequences = 4
@@ -391,7 +400,7 @@ for step in range(max_steps):
         sample_rng.manual_seed(42 + ddp_rank)
         enc = tiktoken.encoding_for_model("gpt-2")
         context_tokens = enc.encode(sample_context)
-        context_tensor = torch.tensor(context_tokens, dtype=torch.long)
+        context_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device)
         context_tensor = context_tensor.unsqueeze(0).repeat(num_return_sequences, 1)
         while context_tensor.size(-1) < max_length:
             with torch.no_grad():
@@ -412,7 +421,7 @@ for step in range(max_steps):
         model.eval()
         num_total = 0
         num_correct_norm = 0
-        for example in iterate_examples("val"):
+        for i, example in enumerate(iterate_examples("val")):
             if i % ddp_world_size != ddp_rank:
                 continue
             _, tokens, mask, label = render_example(example)
@@ -461,11 +470,15 @@ for step in range(max_steps):
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optim.step()
+    if device_type == "cuda":
+        torch.cuda.synchronize() # wait for the GPU to finish work
     end_time = time.time()
     if master_process:
         print(
-            f"step {step}, lr {lr:.4f}, loss {loss.item()}, time {end_time - start_time:.4f}s, tokens/sec {(B*T)/(end_time - start_time):.4f}s, norm {norm:.4f}"
+            f"step {step}, lr {lr:.4f}, loss {loss_accum.item()}, time {end_time - start_time:.4f}s, tokens/sec {(B*T* total_gradient_steps * ddp_world_size)/(end_time - start_time):.4f}s, norm {norm:.4f}"
         )
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 if ddp:
     destroy_process_group()

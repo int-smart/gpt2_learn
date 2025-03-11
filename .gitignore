@@ -2,3 +2,5 @@
 tokens
 edu_*
 hellaswag
+log
+__pycache__

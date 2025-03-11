@@ -17,6 +17,7 @@ from hellaswag import render_example, iterate_examples
 total_batch_size = 524288
 warmup_steps = 715
 max_steps = int(10e9 // total_batch_size)  # For 1 epoch
+dataset_dir = "/kaggle/input/edufineweb"
 ddp = int(os.environ.get("RANK", -1)) != -1
 if ddp:
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
@@ -165,16 +166,16 @@ class DataLoaderLite:
         self.num_processes = num_processes
         assert split in {'train', 'val'}
         self.shards = sorted([
-            s for s in os.listdir(os.path.join(os.path.dirname(__file__), "edu_fineweb10B")) 
+            s for s in os.listdir(dataset_dir, "edu_fineweb10B") 
             if s.startswith(f"edufineweb_{split}_") and s.endswith(".npy")
         ])
         self.current_position = self.process_rank * B * T
         self.split = split
-        self.data = load_token(os.path.join(os.path.dirname(__file__), f"edu_fineweb10B/{self.shards[self.shard_id]}"))
+        self.data = load_token(dataset_dir, f"edu_fineweb10B/{self.shards[self.shard_id]}")
     
     def reset(self):
         self.shard_id = 0
-        self.data = load_token(os.path.join(os.path.dirname(__file__), f"edu_fineweb10B/{self.shards[self.shard_id]}"))
+        self.data = load_token(dataset_dir, f"edu_fineweb10B/{self.shards[self.shard_id]}")
         self.current_position = self.process_rank * self.batch_size * self.context
         
     def next_batch(self):
@@ -195,7 +196,7 @@ class DataLoaderLite:
             > self.data.size(-1)
         ):
             self.shard_id = (self.shard_id + 1) % len(self.shards)
-            self.data = load_token(os.path.join(os.path.dirname(__file__), f"edu_fineweb10B/{self.shards[self.shard_id]}"))
+            self.data = load_token(dataset_dir, f"edu_fineweb10B/{self.shards[self.shard_id]}")
             self.current_position = self.process_rank * self.batch_size * self.context
         return x, y
 
